@@ -2,7 +2,7 @@
   "name": "domain-recovery-backend",
   "private": true,
   "type": "module",
-  "scripts": { "start": "node server.mjs", "seed": "node scripts/seed.mjs" },
+  "scripts": { "start": "node server.mjs", "seed": "node scripts/seed.mjs", "test": "node --test" },
   "dependencies": {
     "bcryptjs": "latest",
     "dotenv": "latest",
