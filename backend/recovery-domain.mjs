@@ -36,7 +36,9 @@ export function openRecoveryPotential(config,feature,records){
  for(const record of records??[]){
   if(record.payload?.__example)continue;
   if(['Approved','Closed'].includes(record.status))continue;
-  const actual=Number(record.payload?.[rule.actualKey]),expected=Number(record.payload?.[rule.expectedKey]);
+  const rawActual=record.payload?.[rule.actualKey],rawExpected=record.payload?.[rule.expectedKey];
+  if(rawActual==null||String(rawActual).trim()===''||rawExpected==null||String(rawExpected).trim()==='')continue;
+  const actual=Number(rawActual),expected=Number(rawExpected);
   if(!Number.isFinite(actual)||!Number.isFinite(expected))continue;
   const signed=rule.direction==='expected-minus-actual'?expected-actual:actual-expected;
   if(signed>0)total+=signed;

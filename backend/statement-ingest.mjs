@@ -26,6 +26,8 @@ export function statementChecksum(text) {
   return crypto.createHash('sha256').update(String(text), 'utf8').digest('hex');
 }
 
+const validMoneyAmount = value => Number.isFinite(value) && Number.isSafeInteger(Math.round(value * 100)) && Math.abs(value * 100 - Math.round(value * 100)) < 0.000001;
+
 /**
  * Parse a CSV statement. Deliberately strict: a row that cannot be read is
  * reported as rejected rather than silently coerced to zero.
@@ -65,6 +67,8 @@ export function parseStatementCsv(text) {
   const amtI = idx('amount') >= 0 ? idx('amount') : idx('charge') >= 0 ? idx('charge') : 2;
   const dateI = idx('date');
   const curI = idx('currency');
+  const categoryI = idx('expense_category');
+  const propertyI = idx('property_amount');
 
   const rows = [];
   const rejected = [];
@@ -73,8 +77,10 @@ export function parseStatementCsv(text) {
     const cells = split(lines[n]);
     const rawAmount = (cells[amtI] ?? '').replace(/[$,]/g, '');
     const amount = Number(rawAmount);
+    const propertyAmount = propertyI >= 0 ? String(cells[propertyI] ?? '').replace(/[$,]/g, '').trim() : '';
 
-    if (!Number.isFinite(amount)) {
+    if (!/^-?\d+(?:\.\d{1,2})?$/.test(rawAmount.trim()) || !validMoneyAmount(amount) ||
+        (propertyAmount && (!/^\d+(?:\.\d{1,2})?$/.test(propertyAmount) || !validMoneyAmount(Number(propertyAmount))))) {
       rejected.push({
         line: n + 1,
         reason: `amount "${cells[amtI] ?? ''}" is not a number`,
@@ -90,6 +96,8 @@ export function parseStatementCsv(text) {
       amount,
       date: dateI >= 0 ? String(cells[dateI] ?? '').trim() : null,
       currency: curI >= 0 ? String(cells[curI] ?? '').trim().toUpperCase() || 'USD' : 'USD',
+      expenseCategory: categoryI >= 0 ? String(cells[categoryI] ?? '').trim() : null,
+      propertyAmount: propertyAmount || null,
     });
   }
 
@@ -112,8 +120,12 @@ export function parseStatementJson(text) {
   const rows = [];
   const rejected = [];
   source.forEach((r, i) => {
-    const amount = Number(r?.amount ?? r?.charge);
-    if (!Number.isFinite(amount)) {
+    const rawAmount = r?.amount ?? r?.charge;
+    const amount = Number(rawAmount);
+    const propertyAmount = r?.propertyAmount ?? r?.property_amount;
+    if (rawAmount === undefined || rawAmount === null || !/^-?\d+(?:\.\d{1,2})?$/.test(String(rawAmount).trim()) || !validMoneyAmount(amount) ||
+        (propertyAmount !== undefined && propertyAmount !== null && String(propertyAmount).trim() !== '' &&
+          (!/^\d+(?:\.\d{1,2})?$/.test(String(propertyAmount).trim()) || !validMoneyAmount(Number(propertyAmount))))) {
       rejected.push({ line: i + 1, reason: `amount "${r?.amount ?? ''}" is not a number`, raw: JSON.stringify(r).slice(0, 200) });
       return;
     }
@@ -124,6 +136,8 @@ export function parseStatementJson(text) {
       amount,
       date: r?.date ? String(r.date).trim() : null,
       currency: String(r?.currency ?? 'USD').toUpperCase(),
+      expenseCategory: String(r?.expenseCategory ?? r?.expense_category ?? '').trim() || null,
+      propertyAmount: propertyAmount === undefined || propertyAmount === null || String(propertyAmount).trim() === '' ? null : String(propertyAmount).trim(),
     });
   });
 
@@ -150,7 +164,7 @@ export function parseStatement(text, format) {
  * negative statement amount is classified as a credit line rather than assumed
  * recovery. Entries without a rule or without the expected field stay assumed.
  */
-export function reconcile(statementRows, records, rule) {
+export function reconcile(statementRows, records, rule, allowMultipleLines = false) {
   const byRef = new Map();
   for (const rec of records ?? []) {
     const key = String(rec.reference ?? '').trim();
@@ -184,27 +198,29 @@ export function reconcile(statementRows, records, rule) {
       unmatched.push({ ...entry, status: 'unmatched', reason: 'No record in this workspace matches the statement reference' });
       continue;
     }
-    if (seen.has(row.reference)) {
-      unmatched.push({ ...entry, status: 'duplicate_line', reason: 'Reference already reconciled from an earlier line in this statement' });
-      continue;
-    }
-    seen.add(row.reference);
-
-    if (rec.payload?.__example) {
-      ignored.push({ ...entry, status: 'seeded_example_ignored', recordReference: rec.reference, reason: 'Seeded example record; it cannot support confirmed recovery' });
-      continue;
-    }
     if (row.amount < 0) {
       credits.push({ ...entry, status: 'credit_line', recordReference: rec.reference, reason: 'Negative statement amount is a credit memo, not a recovery' });
       continue;
     }
+    if (!allowMultipleLines && seen.has(row.reference)) {
+      unmatched.push({ ...entry, status: 'duplicate_line', reason: 'Reference already reconciled from an earlier line in this statement' });
+      continue;
+    }
+    if (!allowMultipleLines) seen.add(row.reference);
+
+    if (rec.payload?.__example) {
+      ignored.push({ ...entry, status: 'seeded_example_ignored', recordReference: rec.reference, reason: 'Seeded example record; it cannot support a source-supported variance' });
+      continue;
+    }
+
     if (!rule) {
       assumed.push({ ...entry, status: 'assumed_no_rule', recordReference: rec.reference, reason: 'This capability has no configured recovery rule, so no source-supported recovery can be confirmed' });
       continue;
     }
 
-    const expected = Number(rec.payload?.[rule.expectedKey]);
-    if (!Number.isFinite(expected)) {
+    const rawExpected = rec.payload?.[rule.expectedKey];
+    const expected = rawExpected == null || String(rawExpected).trim() === '' ? NaN : Number(rawExpected);
+    if (!validMoneyAmount(expected)) {
       assumed.push({
         ...entry,
         status: 'assumed_missing_expected_amount',
@@ -257,8 +273,8 @@ export function reconcile(statementRows, records, rule) {
       noRecoveryEntries: noRecovery.length,
     },
     disclaimer:
-      'Only variances supported by an ingested statement line and the configured recovery rule are reported as confirmed recovery. ' +
-      'Typed values, seeded examples, and credit memos never become confirmed refunds.',
+      'Positive variances supported by an ingested statement line and the configured recovery rule are candidates for review, not proof of a received refund. ' +
+      'Typed values, seeded examples, and credit memos never establish a paid recovery.',
   };
 }
 
@@ -266,11 +282,11 @@ export function reconcile(statementRows, records, rule) {
  * Build the ingest result without touching the database, so callers can
  * preview and persist exactly the same figures.
  */
-export function ingestStatement({ text, format, sourceFile, records, rule }) {
+export function ingestStatement({ text, format, sourceFile, records, rule, allowMultipleLines = false }) {
   const checksum = statementChecksum(text);
   const parsed = parseStatement(text, format);
   const rows = parsed.rows.map((r) => ({ ...r, checksum, sourceFile: sourceFile ?? 'upload' }));
-  const recon = reconcile(rows, records, rule);
+  const recon = reconcile(rows, records, rule, allowMultipleLines);
 
   return {
     checksum,
@@ -286,8 +302,8 @@ export function ingestStatement({ text, format, sourceFile, records, rule }) {
       'Amounts are read verbatim from the statement; no figures are inferred.',
       'Rows whose amount is not numeric are rejected and listed, never coerced to zero.',
       'The checksum makes ingestion idempotent: the same file re-uploaded does not create new records.',
-      'Recovery is confirmed only where a statement line and the configured recovery rule support it.',
-      'Seeded example records and negative credit lines never become confirmed recovery.',
+      'A positive variance is reported only where a statement line and the configured recovery rule support it; this is not proof of payment.',
+      'Seeded example records and negative credit lines never become a positive candidate variance.',
     ],
   };
 }
